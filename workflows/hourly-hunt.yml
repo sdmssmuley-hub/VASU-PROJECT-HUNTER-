@@ -1,0 +1,82 @@
+name: VASU AI Hourly Project Hunt
+
+on:
+  schedule:
+    # GitHub Actions cron is UTC only. IST = UTC+5:30, so 09:00-18:00 IST
+    # (hourly) = 03:30-12:30 UTC. GitHub may delay scheduled runs by a few
+    # minutes during high load — this is a platform limitation, not a bug.
+    - cron: "30 3 * * *"   # 09:00 IST
+    - cron: "30 4 * * *"   # 10:00 IST
+    - cron: "30 5 * * *"   # 11:00 IST
+    - cron: "30 6 * * *"   # 12:00 IST
+    - cron: "30 7 * * *"   # 13:00 IST
+    - cron: "30 8 * * *"   # 14:00 IST
+    - cron: "30 9 * * *"   # 15:00 IST
+    - cron: "30 10 * * *"  # 16:00 IST
+    - cron: "30 11 * * *"  # 17:00 IST
+    - cron: "30 12 * * *"  # 18:00 IST (also sends the daily report, see second job)
+  workflow_dispatch:
+    inputs:
+      hour:
+        description: "Rotation hour to run (9-18). Leave blank to use the current IST hour."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  hunt:
+    name: hunt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore project database (dedup memory across runs)
+        uses: actions/cache@v4
+        with:
+          path: data/vasu.db
+          key: vasu-db-${{ github.run_id }}
+          restore-keys: |
+            vasu-db-
+
+      - name: Run hunt cycle
+        env:
+          # --- from GitHub Secrets (Settings -> Secrets and variables -> Actions) ---
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LLM_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          # --- fixed configuration ---
+          LLM_PROVIDER: openrouter
+          LLM_BASE_URL: https://openrouter.ai/api/v1
+          LLM_MODEL: ${{ vars.LLM_MODEL || 'meta-llama/llama-3.1-8b-instruct:free' }}
+          SEARCH_PROVIDER: duckduckgo
+          DATABASE_PATH: ./data/vasu.db
+          RUN_HOURS: "9,10,11,12,13,14,15,16,17,18"
+          TIMEZONE: Asia/Kolkata
+          TARGET_LEADS_PER_RUN: "4"
+        run: |
+          if [ -n "${{ github.event.inputs.hour }}" ]; then
+            python -m app.run_once --hour "${{ github.event.inputs.hour }}"
+          else
+            python -m app.run_once
+          fi
+
+      - name: Upload database as artifact (for manual inspection/debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vasu-database-${{ github.run_id }}
+          path: data/vasu.db
+          retention-days: 14
