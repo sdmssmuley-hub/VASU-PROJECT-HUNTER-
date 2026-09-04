@@ -3,6 +3,13 @@ Agent 1 — PROJECT HUNTER
 Generates search queries dynamically, runs them through the configured
 search provider (with fallback chain), and extracts CANDIDATE projects
 using the LLM. Does NOT approve/reject — that is the QC agent's job.
+
+FIX: previously, if the LLM returned unparseable JSON or an empty list,
+this loop just did `continue` with zero logging, so a "0 candidates" run
+looked identical whether the LLM found nothing OR the LLM's response never
+parsed at all. Now every query logs its own outcome, so audit_logs will
+show exactly which queries had results but produced no usable candidates,
+and why.
 """
 from __future__ import annotations
 import itertools
@@ -100,7 +107,8 @@ projects that might need heavy equipment handling (40T-1000T+ transformers, reac
 machinery). For each candidate, output strict JSON: a list of objects with fields: name, client, location, \
 state, industry, equipment_type, status, tender_number, notes. If a field is not in the source text, use \
 "UNKNOWN" — never invent it. Only extract if there is a real signal of heavy equipment movement, tender, \
-award, or installation. Return ONLY a JSON array, no prose, no markdown fences."""
+award, or installation. Return ONLY a JSON array, no prose, no markdown fences. If there is genuinely no \
+qualifying project in the results, return an empty array: []"""
 
 
 def run_hunter(category: str | None, run_id: int, max_queries: int = 15) -> list[dict]:
@@ -112,6 +120,16 @@ def run_hunter(category: str | None, run_id: int, max_queries: int = 15) -> list
     providers = get_fallback_chain()
     llm = get_llm_provider()
     candidates: list[dict] = []
+
+    # Per-run counters so the final summary log tells you WHERE candidates were lost,
+    # not just that the total was zero.
+    stats = {
+        "queries_with_results": 0,
+        "llm_calls_empty_response": 0,
+        "llm_calls_unparseable": 0,
+        "llm_calls_parsed_but_no_valid_items": 0,
+        "llm_calls_ok": 0,
+    }
 
     with db_session() as conn:
         for q in queries:
@@ -133,21 +151,48 @@ def run_hunter(category: str | None, run_id: int, max_queries: int = 15) -> list
             if not results:
                 continue
 
+            stats["queries_with_results"] += 1
+
             joined = "\n\n".join(
                 f"TITLE: {r.title}\nURL: {r.url}\nSNIPPET: {r.snippet}\nDATE: {r.published_date or 'UNKNOWN'}"
                 for r in results
             )
             raw = llm.complete(EXTRACTION_SYSTEM_PROMPT, joined, json_mode=True)
-            parsed = safe_json_parse(raw, default=[])
-            if not isinstance(parsed, list):
+
+            if not raw:
+                stats["llm_calls_empty_response"] += 1
+                log_audit("hunter", "WARNING", f"Empty LLM response for query '{q}' ({len(results)} search results were available).")
                 continue
 
+            parsed = safe_json_parse(raw, default=None)
+            if parsed is None:
+                stats["llm_calls_unparseable"] += 1
+                log_audit("hunter", "WARNING", f"LLM response for '{q}' was not valid/recoverable JSON.")
+                continue
+
+            if not isinstance(parsed, list):
+                stats["llm_calls_unparseable"] += 1
+                log_audit("hunter", "WARNING", f"LLM response for '{q}' parsed but was not a JSON list (got {type(parsed).__name__}).")
+                continue
+
+            valid_items = 0
             for item in parsed:
                 if not isinstance(item, dict) or not item.get("name") or item.get("name") == "UNKNOWN":
                     continue
                 item["_sources"] = [r.to_dict() for r in results]
                 item["_query"] = q
                 candidates.append(item)
+                valid_items += 1
 
-    log_audit("hunter", "INFO", f"Run {run_id} ({category}): {len(candidates)} raw candidates from {len(queries)} queries")
+            if valid_items == 0:
+                stats["llm_calls_parsed_but_no_valid_items"] += 1
+                log_audit("hunter", "INFO", f"LLM for '{q}' returned valid JSON but no qualifying candidates (this can be legitimate).")
+            else:
+                stats["llm_calls_ok"] += 1
+
+    log_audit(
+        "hunter", "INFO",
+        f"Run {run_id} ({category}): {len(candidates)} raw candidates from {len(queries)} queries. "
+        f"Breakdown: {stats}",
+    )
     return candidates
