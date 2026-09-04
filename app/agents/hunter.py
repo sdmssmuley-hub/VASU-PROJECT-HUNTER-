@@ -4,12 +4,23 @@ Generates search queries dynamically, runs them through the configured
 search provider (with fallback chain), and extracts CANDIDATE projects
 using the LLM. Does NOT approve/reject — that is the QC agent's job.
 
-FIX: previously, if the LLM returned unparseable JSON or an empty list,
-this loop just did `continue` with zero logging, so a "0 candidates" run
-looked identical whether the LLM found nothing OR the LLM's response never
-parsed at all. Now every query logs its own outcome, so audit_logs will
-show exactly which queries had results but produced no usable candidates,
-and why.
+FIX #2 (see audit_logs investigation — run 16): the previous version wrapped
+the ENTIRE per-run loop (every search call + every LLM call, potentially
+minutes of network I/O) inside a single `with db_session() as conn:` block,
+holding one open write transaction the whole time. Any log_audit() call made
+from *inside* that loop (including everything logged by llm_provider.py, and
+the per-query WARNING logs added in fix #1) opens its own separate connection
+to the same SQLite file — which SQLite blocks/rejects while another writer's
+transaction is open. Those log_audit() calls were being silently dropped,
+which is why "llm_calls_empty_response: 3" showed up in the final summary
+but not a single llm_provider log line existed to explain *why* they were
+empty.
+
+Fix: each search_queries INSERT now happens in its own short-lived
+db_session (opened, single write, closed immediately) instead of one
+transaction held open across the whole loop. This means log_audit() calls
+made during search/LLM calls no longer race against an open transaction, so
+they'll actually land in audit_logs from now on.
 """
 from __future__ import annotations
 import itertools
@@ -111,6 +122,16 @@ award, or installation. Return ONLY a JSON array, no prose, no markdown fences. 
 qualifying project in the results, return an empty array: []"""
 
 
+def _log_query_result(run_id: int, q: str, category: str | None, result_count: int) -> None:
+    """Short-lived transaction: open, write one row, close. Does NOT stay open
+    while search/LLM network calls happen, so it can't block log_audit()."""
+    with db_session() as conn:
+        conn.execute(
+            "INSERT INTO search_queries (run_id, query, category, executed_at, result_count) VALUES (?,?,?,?,?)",
+            (run_id, q, category or "general", now_iso(), result_count),
+        )
+
+
 def run_hunter(category: str | None, run_id: int, max_queries: int = 15) -> list[dict]:
     """
     Executes the search + extraction pass for one scheduler run.
@@ -121,8 +142,6 @@ def run_hunter(category: str | None, run_id: int, max_queries: int = 15) -> list
     llm = get_llm_provider()
     candidates: list[dict] = []
 
-    # Per-run counters so the final summary log tells you WHERE candidates were lost,
-    # not just that the total was zero.
     stats = {
         "queries_with_results": 0,
         "llm_calls_empty_response": 0,
@@ -131,64 +150,61 @@ def run_hunter(category: str | None, run_id: int, max_queries: int = 15) -> list
         "llm_calls_ok": 0,
     }
 
-    with db_session() as conn:
-        for q in queries:
-            results = []
-            for provider in providers:
-                try:
-                    results = provider.search(q, max_results=8)
-                    if results:
-                        break
-                except Exception as e:
-                    log_audit("hunter", "WARNING", f"Provider {provider.__class__.__name__} failed on '{q}': {e}")
-                    continue
-
-            conn.execute(
-                "INSERT INTO search_queries (run_id, query, category, executed_at, result_count) VALUES (?,?,?,?,?)",
-                (run_id, q, category or "general", now_iso(), len(results)),
-            )
-
-            if not results:
+    for q in queries:
+        results = []
+        for provider in providers:
+            try:
+                results = provider.search(q, max_results=8)
+                if results:
+                    break
+            except Exception as e:
+                log_audit("hunter", "WARNING", f"Provider {provider.__class__.__name__} failed on '{q}': {e}")
                 continue
 
-            stats["queries_with_results"] += 1
+        # Own short transaction — no longer held open during the LLM call below.
+        _log_query_result(run_id, q, category, len(results))
 
-            joined = "\n\n".join(
-                f"TITLE: {r.title}\nURL: {r.url}\nSNIPPET: {r.snippet}\nDATE: {r.published_date or 'UNKNOWN'}"
-                for r in results
-            )
-            raw = llm.complete(EXTRACTION_SYSTEM_PROMPT, joined, json_mode=True)
+        if not results:
+            continue
 
-            if not raw:
-                stats["llm_calls_empty_response"] += 1
-                log_audit("hunter", "WARNING", f"Empty LLM response for query '{q}' ({len(results)} search results were available).")
+        stats["queries_with_results"] += 1
+
+        joined = "\n\n".join(
+            f"TITLE: {r.title}\nURL: {r.url}\nSNIPPET: {r.snippet}\nDATE: {r.published_date or 'UNKNOWN'}"
+            for r in results
+        )
+        raw = llm.complete(EXTRACTION_SYSTEM_PROMPT, joined, json_mode=True)
+
+        if not raw:
+            stats["llm_calls_empty_response"] += 1
+            log_audit("hunter", "WARNING", f"Empty LLM response for query '{q}' ({len(results)} search results were available). Check llm_provider logs above for the reason.")
+            continue
+
+        parsed = safe_json_parse(raw, default=None)
+        if parsed is None:
+            stats["llm_calls_unparseable"] += 1
+            log_audit("hunter", "WARNING", f"LLM response for '{q}' was not valid/recoverable JSON.")
+            continue
+
+        if not isinstance(parsed, list):
+            stats["llm_calls_unparseable"] += 1
+            log_audit("hunter", "WARNING", f"LLM response for '{q}' parsed but was not a JSON list (got {type(parsed).__name__}).")
+            continue
+
+        valid_items = 0
+        for item in parsed:
+            if not isinstance(item, dict) or not item.get("name") or item.get("name") == "UNKNOWN":
                 continue
+            item["_sources"] = [r.to_dict() for r in results]
+            item["_query"] = q
+            candidates.append(item)
+            valid_items += 1
 
-            parsed = safe_json_parse(raw, default=None)
-            if parsed is None:
-                stats["llm_calls_unparseable"] += 1
-                log_audit("hunter", "WARNING", f"LLM response for '{q}' was not valid/recoverable JSON.")
-                continue
-
-            if not isinstance(parsed, list):
-                stats["llm_calls_unparseable"] += 1
-                log_audit("hunter", "WARNING", f"LLM response for '{q}' parsed but was not a JSON list (got {type(parsed).__name__}).")
-                continue
-
-            valid_items = 0
-            for item in parsed:
-                if not isinstance(item, dict) or not item.get("name") or item.get("name") == "UNKNOWN":
-                    continue
-                item["_sources"] = [r.to_dict() for r in results]
-                item["_query"] = q
-                candidates.append(item)
-                valid_items += 1
-
-            if valid_items == 0:
-                stats["llm_calls_parsed_but_no_valid_items"] += 1
-                log_audit("hunter", "INFO", f"LLM for '{q}' returned valid JSON but no qualifying candidates (this can be legitimate).")
-            else:
-                stats["llm_calls_ok"] += 1
+        if valid_items == 0:
+            stats["llm_calls_parsed_but_no_valid_items"] += 1
+            log_audit("hunter", "INFO", f"LLM for '{q}' returned valid JSON but no qualifying candidates (this can be legitimate).")
+        else:
+            stats["llm_calls_ok"] += 1
 
     log_audit(
         "hunter", "INFO",
